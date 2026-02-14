@@ -25,6 +25,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  ACR_NAME: wmpagreenwaldhelloworldacr
+  ACR_LOGIN_SERVER: wmpagreenwaldhelloworldacr.azurecr.io
+  IMAGE_NAME: helloworld-java
+
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
   TF_WORKING_DIR: "."
@@ -44,7 +48,7 @@ env:
 jobs:
   plan:
     name: Terraform Plan
-    if: ${{ inputs.action == 'plan' }}
+    if: ${{ inputs.action == 'plan' || inputs.action == 'apply' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -82,6 +86,7 @@ jobs:
         run: |
           terraform plan \
             -var-file="vars/${{ inputs.environment }}.tfvars" \
+            -var="image_tag=${GITHUB_SHA}" \
             -out="tfplan"
 
       - name: Terraform Show (human-readable)
@@ -98,14 +103,35 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Add plan to job summary
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "## Terraform Plan (${{ inputs.environment }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          # Keep summary reasonable size
+          head -n 400 tfplan.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
   apply:
-    name: Terraform Apply
+    name: Terraform Apply (approval required)
     if: ${{ inputs.action == 'apply' }}
+    needs: [plan]
     runs-on: ubuntu-latest
+
+    # This is what enforces manual approval (configure required reviewers in repo settings)
+    environment:
+      name: ${{ inputs.environment }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download plan artifact from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -129,33 +155,22 @@ jobs:
             -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
             -backend-config="key=${{ inputs.environment }}.tfstate"
 
-      # - name: Download plan artifact from this workflow run
-      #   uses: actions/download-artifact@v4
-      #   with:
-      #     # NOTE: this works when "apply" is run in the SAME workflow run_id as the uploaded artifact.
-      #     name: tfplan-${{ inputs.environment }}-${{ github.run_id }}
-      #     path: ${{ env.TF_WORKING_DIR }}
-
-      # - name: Verify plan exists
-      #   working-directory: ${{ env.TF_WORKING_DIR }}
-      #   run: |
-      #     ls -la
-      #     test -f tfplan
-
-      # - name: Terraform Apply (apply EXACT plan)
-      #   working-directory: ${{ env.TF_WORKING_DIR }}
-      #   run: terraform apply -auto-approve tfplan
-
-      - name: Terraform Validate
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform validate
-
-      - name: Terraform Apply
+      - name: Verify plan exists
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform apply \
-            -var-file="vars/${{ inputs.environment }}.tfvars" \
-            -auto-approve
+          ls -la
+          test -f tfplan
+          test -f tfplan.txt
+
+      - name: Build & Push Docker image to ACR (tag = GitHub SHA)
+        run: |
+          az acr login --name $ACR_NAME
+          docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA} .
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}
+
+      - name: Terraform Apply (apply EXACT plan)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
 
   destroy:
     name: Terraform Destroy
@@ -192,9 +207,13 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform validate
 
-      - name: Terraform Destroy
+      - name: Terraform Destroy (targeted to AKS + k8s only)
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           terraform destroy \
             -var-file="vars/${{ inputs.environment }}.tfvars" \
+            -target=kubernetes_job_v1.hello_world_job \
+            -target=kubernetes_namespace_v1.hello_world_ns \
+            -target=azurerm_role_assignment.this \
+            -target=azurerm_kubernetes_cluster.aks \
             -auto-approve
